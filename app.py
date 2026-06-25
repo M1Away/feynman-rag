@@ -1,6 +1,6 @@
 """
-费曼三层解释器 - Day 4 RAG 版
-新增：从本地知识库检索相关片段 → 基于文档内容生成解释
+费曼三层解释器 - Day 6 调试版
+新增：检索质量可视化 + 相似度分数 + 切片策略实验
 """
 
 import os
@@ -15,13 +15,13 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "BAAI", "bge-smal
 # ── 页面配置 ─────────────────────────────────────────────
 st.set_page_config(page_title="费曼三层解释器", page_icon="🧠", layout="wide")
 st.title("🧠 费曼三层解释器")
-st.caption("输入任何概念，AI 用三种深度为你解释 | Day 4 · RAG 知识库版")
+st.caption("输入任何概念，AI 用三种深度为你解释 | Day 6 · 检索质量可视化")
 
 # ── 侧边栏 ───────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ API 配置")
     api_key = st.text_input(
-        "DeepSeek API Key", type="password", value="sk-fbc3d99ed8b94b8db56972ff88ba6da4",
+        "DeepSeek API Key", type="password", value="",
         help="从 platform.deepseek.com 获取",
     )
     model = st.selectbox("模型", ["deepseek-chat", "deepseek-reasoner"], index=0)
@@ -114,16 +114,32 @@ PROMPTS = {
     "🧪 给领域专家": (SYSTEM_LAYER3, "从专家视角闲聊这个概念，优先参考提供的资料："),
 }
 
-# ── 检索函数 ─────────────────────────────────────────────
+# ── 检索函数（Day 6：返回分数） ───────────────────────────
 
-def retrieve_context(question: str, k: int) -> str:
-    """从 ChromaDB 检索最相关的 k 个片段，拼接成上下文字符串"""
-    docs = vectordb.similarity_search(question, k=k)
+def retrieve_context(question: str, k: int):
+    """
+    从 ChromaDB 检索，返回 (上下文文本, 带分数的片段列表)
+    ChromaDB 默认返回的是 L2 距离，归一化后转成余弦相似度: 1 - distance/2
+    """
+    docs_with_scores = vectordb.similarity_search_with_score(question, k=k)
     parts = []
-    for i, doc in enumerate(docs):
+    scored_docs = []
+
+    for i, (doc, score) in enumerate(docs_with_scores):
         source = doc.metadata.get("source", "未知")
-        parts.append(f"[片段{i+1} · 来源：{source}]\n{doc.page_content}")
-    return "\n\n---\n\n".join(parts)
+        # L2距离转相似度（归一化后 L2 范围 [0, 2]，转为 [0, 1]）
+        similarity = max(0.0, min(1.0, 1.0 - score / 2.0))
+        parts.append(f"[片段{i+1} · 来源：{source} · 相似度：{similarity:.2%}]\n{doc.page_content}")
+        scored_docs.append({
+            "index": i + 1,
+            "source": source,
+            "score": score,
+            "similarity": similarity,
+            "content": doc.page_content,
+        })
+
+    context = "\n\n---\n\n".join(parts)
+    return context, scored_docs
 
 
 # ── 流式调用 ─────────────────────────────────────────────
@@ -172,14 +188,41 @@ if st.button("✨ 生成三层解释", type="primary", use_container_width=True)
 
         # ── 检索 ──
         context = ""
+        scored_docs = []
         if use_rag and vectordb:
             with st.spinner("🔍 检索知识库..."):
-                context = retrieve_context(question, top_k)
+                context, scored_docs = retrieve_context(question, top_k)
 
-        # ── 展示检索片段（调试用） ──
-        if context:
-            with st.expander("📎 检索到的资料片段", expanded=False):
-                st.text(context)
+        # ── 检索质量调试面板（Day 6 新增） ──
+        if scored_docs:
+            with st.expander("📎 检索质量调试面板", expanded=True):
+                st.caption(f"🔍 问题：{question}")
+                st.divider()
+                for doc in scored_docs:
+                    sim = doc["similarity"]
+                    # 颜色编码：≥70% 绿，40-70% 黄，<40% 红
+                    if sim >= 0.70:
+                        color = "#10b981"
+                        label = "🟢 高相关"
+                    elif sim >= 0.40:
+                        color = "#f59e0b"
+                        label = "🟡 中相关"
+                    else:
+                        color = "#ef4444"
+                        label = "🔴 低相关"
+
+                    st.markdown(
+                        f"**片段 {doc['index']}** · {label} · "
+                        f"相似度 `{sim:.1%}` · 来源 `{doc['source']}`"
+                    )
+                    # 相似度进度条
+                    st.progress(sim)
+                    # 片段原文（截取前300字）
+                    preview = doc["content"][:300]
+                    if len(doc["content"]) > 300:
+                        preview += "..."
+                    st.text(preview)
+                    st.divider()
 
         # ── 生成解释 ──
         if view_mode == "📊 三栏并排":
@@ -225,4 +268,4 @@ if st.button("✨ 生成三层解释", type="primary", use_container_width=True)
             st.caption("💡 本次回答仅基于 AI 自身知识（未启用知识库或知识库为空）。")
 
 st.divider()
-st.caption("Day 4 · RAG 知识库版 · 费曼项目 · Away")
+st.caption("Day 6 · 检索质量可视化 · 费曼项目 · Away")

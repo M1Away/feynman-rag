@@ -1,11 +1,13 @@
 """
-费曼三层解释器 - Day 6 调试版
-新增：检索质量可视化 + 相似度分数 + 切片策略实验
+费曼三层解释器 - Day 7 混合检索版
+新增：BM25 关键词检索 + BGE 语义检索 = 混合检索
 """
 
 import os
+import json
 import streamlit as st
 from openai import OpenAI
+from rank_bm25 import BM25Okapi
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 
@@ -15,7 +17,7 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "BAAI", "bge-smal
 # ── 页面配置 ─────────────────────────────────────────────
 st.set_page_config(page_title="费曼三层解释器", page_icon="🧠", layout="wide")
 st.title("🧠 费曼三层解释器")
-st.caption("输入任何概念，AI 用三种深度为你解释 | Day 6 · 检索质量可视化")
+st.caption("输入任何概念，AI 用三种深度为你解释 | Day 7 · 混合检索")
 
 # ── 侧边栏 ───────────────────────────────────────────────
 with st.sidebar:
@@ -37,9 +39,13 @@ with st.sidebar:
                         help="关闭后只靠 AI 自身知识回答，不查文档")
     top_k = st.slider("检索片段数", 1, 5, 3,
     help="从知识库取几个最相关的片段给 AI 参考")
+    bm25_weight = st.slider(
+        "BM25 关键词权重", 0.0, 1.0, 0.5, 0.1,
+        help="0=纯语义检索，1=纯关键词匹配。专有名词搜不到时拉高这个"
+    )
     st.caption("💡 先用 `python ingest.py` 构建知识库")
 
-# ── 加载向量库 ───────────────────────────────────────────
+# ── 加载向量库 + BM25 ─────────────────────────────────────
 
 @st.cache_resource
 def load_vectordb():
@@ -58,7 +64,25 @@ def load_vectordb():
         embedding_function=embeddings,
     )
 
+
+@st.cache_resource
+def load_bm25():
+    """加载所有片段文本，构建 BM25 关键词检索引擎"""
+    json_path = os.path.join("chroma_db", "chunks.json")
+    if not os.path.exists(json_path):
+        return None, []
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+
+    # 字符级分词（中文友好，不依赖 jieba）
+    tokenized = [list(c["content"]) for c in chunks]
+    bm25 = BM25Okapi(tokenized)
+    return bm25, chunks
+
+
 vectordb = load_vectordb()
+bm25, bm25_chunks = load_bm25()
 
 if vectordb is None and use_rag:
     st.warning("⚠️ 知识库尚未构建。请在终端运行 `python ingest.py` 先摄取文档。")
@@ -114,31 +138,85 @@ PROMPTS = {
     "🧪 给领域专家": (SYSTEM_LAYER3, "从专家视角闲聊这个概念，优先参考提供的资料："),
 }
 
-# ── 检索函数（Day 6：返回分数） ───────────────────────────
+# ── 混合检索（Day 7：BM25 + BGE） ─────────────────────────
 
-def retrieve_context(question: str, k: int):
+def retrieve_context(question: str, k: int, bm25_w: float):
     """
-    从 ChromaDB 检索，返回 (上下文文本, 带分数的片段列表)
-    ChromaDB 默认返回的是 L2 距离，归一化后转成余弦相似度: 1 - distance/2
+    混合检索 = BM25关键词 + BGE语义
+    bm25_w=0 → 纯语义；bm25_w=1 → 纯关键词；默认0.5各一半
     """
-    docs_with_scores = vectordb.similarity_search_with_score(question, k=k)
-    parts = []
+    # ── 1. 语义检索（向量） ──
+    vector_results = {}  # content_hash → {score, source, content, method}
+    docs_with_scores = vectordb.similarity_search_with_score(question, k=k * 3)
+    for doc, score in docs_with_scores:
+        sim = max(0.0, min(1.0, 1.0 - score / 2.0))
+        key = doc.page_content[:100]  # 用前100字做去重key
+        vector_results[key] = {
+            "similarity": sim,
+            "source": doc.metadata.get("source", "未知"),
+            "content": doc.page_content,
+            "method": "语义",
+        }
+
+    # ── 2. 关键词检索（BM25） ──
+    bm25_results = {}
+    if bm25 and bm25_chunks and bm25_w > 0:
+        tokenized_query = list(question)
+        bm25_scores = bm25.get_scores(tokenized_query)
+        # 取 BM25 分数最高的 k*3 个，归一化
+        top_indices = sorted(
+            range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
+        )[: k * 3]
+        if top_indices:
+            max_bm25 = bm25_scores[top_indices[0]]
+            for idx in top_indices:
+                norm_score = bm25_scores[idx] / max_bm25 if max_bm25 > 0 else 0
+                key = bm25_chunks[idx]["content"][:100]
+                bm25_results[key] = {
+                    "similarity": round(norm_score, 4),
+                    "source": bm25_chunks[idx]["source"],
+                    "content": bm25_chunks[idx]["content"],
+                    "method": "关键词",
+                }
+
+    # ── 3. 合并 ──
+    merged = {}
+    for key, info in vector_results.items():
+        merged[key] = {
+            **info,
+            "final_score": info["similarity"] * (1 - bm25_w),
+            "methods": [info["method"]],
+        }
+    for key, info in bm25_results.items():
+        if key in merged:
+            merged[key]["final_score"] += info["similarity"] * bm25_w
+            merged[key]["methods"].append(info["method"])
+        else:
+            merged[key] = {
+                **info,
+                "final_score": info["similarity"] * bm25_w,
+                "methods": [info["method"]],
+            }
+
+    # ── 4. 排序取 top_k ──
+    sorted_items = sorted(merged.items(), key=lambda x: x[1]["final_score"], reverse=True)
     scored_docs = []
-
-    for i, (doc, score) in enumerate(docs_with_scores):
-        source = doc.metadata.get("source", "未知")
-        # L2距离转相似度（归一化后 L2 范围 [0, 2]，转为 [0, 1]）
-        similarity = max(0.0, min(1.0, 1.0 - score / 2.0))
-        parts.append(f"[片段{i+1} · 来源：{source} · 相似度：{similarity:.2%}]\n{doc.page_content}")
+    parts = []
+    for i, (_, info) in enumerate(sorted_items[:k]):
+        method_tag = "+".join(info["methods"])
         scored_docs.append({
             "index": i + 1,
-            "source": source,
-            "score": score,
-            "similarity": similarity,
-            "content": doc.page_content,
+            "source": info["source"],
+            "similarity": info["final_score"],
+            "content": info["content"],
+            "method": method_tag,
         })
+        parts.append(
+            f"[片段{i+1} · {method_tag} · 来源：{info['source']} · "
+            f"得分：{info['final_score']:.2%}]\n{info['content']}"
+        )
 
-    context = "\n\n---\n\n".join(parts)
+    context = "\n\n---\n\n".join(parts) if parts else ""
     return context, scored_docs
 
 
@@ -191,7 +269,7 @@ if st.button("✨ 生成三层解释", type="primary", use_container_width=True)
         scored_docs = []
         if use_rag and vectordb:
             with st.spinner("🔍 检索知识库..."):
-                context, scored_docs = retrieve_context(question, top_k)
+                context, scored_docs = retrieve_context(question, top_k, bm25_weight)
 
         # ── 检索质量调试面板（Day 6 新增） ──
         if scored_docs:
@@ -211,9 +289,11 @@ if st.button("✨ 生成三层解释", type="primary", use_container_width=True)
                         color = "#ef4444"
                         label = "🔴 低相关"
 
+                    method_tag = doc.get("method", "语义")
                     st.markdown(
                         f"**片段 {doc['index']}** · {label} · "
-                        f"相似度 `{sim:.1%}` · 来源 `{doc['source']}`"
+                        f"`{method_tag}` · "
+                        f"得分 `{sim:.1%}` · 来源 `{doc['source']}`"
                     )
                     # 相似度进度条
                     st.progress(sim)
@@ -268,4 +348,4 @@ if st.button("✨ 生成三层解释", type="primary", use_container_width=True)
             st.caption("💡 本次回答仅基于 AI 自身知识（未启用知识库或知识库为空）。")
 
 st.divider()
-st.caption("Day 6 · 检索质量可视化 · 费曼项目 · Away")
+st.caption("Day 7 · 混合检索(BM25+BGE) · 费曼项目 · Away")
